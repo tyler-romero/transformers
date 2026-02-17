@@ -781,38 +781,18 @@ class Olmo3_2HybridPreTrainedModel(Qwen3NextPreTrainedModel):
 
     @torch.no_grad()
     def _init_weights(self, module):
-        std = self.config.initializer_range
-        if isinstance(module, nn.Linear):
-            init.normal_(module.weight, mean=0.0, std=std)
-            if module.bias is not None:
-                init.zeros_(module.bias)
-        elif isinstance(module, nn.Embedding):
-            init.normal_(module.weight, mean=0.0, std=std)
-            if module.padding_idx is not None:
-                module.weight.data[module.padding_idx].zero_()
-        elif isinstance(module, nn.Conv1d):
-            init.normal_(module.weight, mean=0.0, std=std)
-            if module.bias is not None:
-                init.zeros_(module.bias)
-        elif isinstance(module, (Olmo3_2HybridRMSNorm, Olmo3_2HybridRMSNormGated)) or (
-            FusedRMSNormGated is not None and isinstance(module, FusedRMSNormGated)
-        ):
-            init.ones_(module.weight)
-        elif isinstance(module, Olmo3_2HybridGatedDeltaNet):
+        super()._init_weights(module)
+        if isinstance(module, Olmo3_2HybridGatedDeltaNet):
             init.copy_(module.A_log, torch.empty_like(module.A_log).uniform_(0, 16).log_())
             dt_min, dt_max, dt_init_floor = 0.001, 0.1, 1e-4
             dt = torch.exp(torch.rand_like(module.dt_bias) * (math.log(dt_max) - math.log(dt_min)) + math.log(dt_min))
             dt = torch.clamp(dt, min=dt_init_floor)
             inv_dt = dt + torch.log(-torch.expm1(-dt))
             init.copy_(module.dt_bias, inv_dt)
-        elif isinstance(module, Olmo3_2HybridRotaryEmbedding):
-            if not module.disabled:
-                rope_init_fn = module.compute_default_rope_parameters
-                if module.rope_type != "default":
-                    rope_init_fn = ROPE_INIT_FUNCTIONS[module.rope_type]
-                inv_freq, _ = rope_init_fn(module.config, module.inv_freq.device)
-                init.copy_(module.inv_freq, inv_freq)
-                init.copy_(module.original_inv_freq, inv_freq)
+        elif isinstance(module, (Olmo3_2HybridRMSNorm, Olmo3_2HybridRMSNormGated)) or (
+            FusedRMSNormGated is not None and isinstance(module, FusedRMSNormGated)
+        ):
+            init.ones_(module.weight)
 
 
 class Olmo3_2HybridModel(Olmo3_2HybridPreTrainedModel):
