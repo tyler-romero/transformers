@@ -27,7 +27,7 @@ from ...configuration_utils import layer_type_validation
 from ...masking_utils import create_causal_mask
 from ...modeling_outputs import BaseModelOutputWithPast
 from ...modeling_rope_utils import ROPE_INIT_FUNCTIONS
-from ...modeling_utils import ALL_ATTENTION_FUNCTIONS
+from ...modeling_utils import ALL_ATTENTION_FUNCTIONS, PreTrainedModel
 from ...processing_utils import Unpack
 from ...utils import TransformersKwargs, logging
 from ...utils.generic import check_model_inputs
@@ -781,7 +781,7 @@ class Olmo3_2HybridPreTrainedModel(Qwen3NextPreTrainedModel):
 
     @torch.no_grad()
     def _init_weights(self, module):
-        super()._init_weights(module)
+        PreTrainedModel._init_weights(self, module)
         if isinstance(module, Olmo3_2HybridGatedDeltaNet):
             init.copy_(module.A_log, torch.empty_like(module.A_log).uniform_(0, 16).log_())
             dt_min, dt_max, dt_init_floor = 0.001, 0.1, 1e-4
