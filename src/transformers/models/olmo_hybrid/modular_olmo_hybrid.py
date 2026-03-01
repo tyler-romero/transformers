@@ -152,6 +152,9 @@ class OlmoHybridConfig(LlamaConfig):
             Floor value for clamping dt during initialization in GatedDeltaNet layers.
         linear_conv_kernel_dim (`int`, *optional*, defaults to 4):
             Kernel size for the short convolution applied to queries, keys, and values in linear attention layers.
+        linear_use_gate (`bool`, *optional*, defaults to `True`):
+            Whether to use a gating mechanism in the GatedDeltaNet linear attention layers. When `True`,
+            a separate gate projection (`g_proj`) is applied with gated RMSNorm on the output.
         linear_allow_neg_eigval (`bool`, *optional*, defaults to `True`):
             Whether to allow negative eigenvalues in the GatedDeltaNet recurrence. When `True`, the beta
             parameter is scaled by 2.0 to allow values in range [0, 2] instead of [0, 1].
@@ -211,6 +214,7 @@ class OlmoHybridConfig(LlamaConfig):
         linear_dt_max: float = 0.1,
         linear_dt_init_floor: float = 1e-4,
         linear_conv_kernel_dim: int = 4,
+        linear_use_gate: bool = True,
         linear_allow_neg_eigval: bool = True,
         **kwargs,
     ):
@@ -251,6 +255,7 @@ class OlmoHybridConfig(LlamaConfig):
         self.linear_dt_max = linear_dt_max
         self.linear_dt_init_floor = linear_dt_init_floor
         self.linear_conv_kernel_dim = linear_conv_kernel_dim
+        self.linear_use_gate = linear_use_gate
         self.linear_allow_neg_eigval = linear_allow_neg_eigval
 
         super().__init__(
@@ -505,6 +510,7 @@ class OlmoHybridGatedDeltaNet(nn.Module):
         self.value_dim = self.head_v_dim * self.num_v_heads
         self.layer_idx = layer_idx
         self.conv_kernel_size = config.linear_conv_kernel_dim
+        self.use_gate = config.linear_use_gate
         self.allow_neg_eigval = config.linear_allow_neg_eigval
         self.eps = config.rms_norm_eps
 
@@ -514,7 +520,8 @@ class OlmoHybridGatedDeltaNet(nn.Module):
         self.a_proj = nn.Linear(self.hidden_size, self.num_v_heads, bias=False)
         self.b_proj = nn.Linear(self.hidden_size, self.num_v_heads, bias=False)
 
-        self.g_proj = nn.Linear(self.hidden_size, self.value_dim, bias=False)
+        if self.use_gate:
+            self.g_proj = nn.Linear(self.hidden_size, self.value_dim, bias=False)
 
         self.o_proj = nn.Linear(self.value_dim, self.hidden_size, bias=False)
 
@@ -553,16 +560,19 @@ class OlmoHybridGatedDeltaNet(nn.Module):
         self.dt_bias = nn.Parameter(inv_dt)
 
         # Output norm - NOTE: FLA's FusedRMSNormGated uses eps=1e-5 by default
-        self.o_norm = (
-            OlmoHybridRMSNormGated(self.head_v_dim, eps=1e-5)
-            if FusedRMSNormGated is None
-            else FusedRMSNormGated(
-                self.head_v_dim,
-                eps=1e-5,
-                device=torch.cuda.current_device(),
-                dtype=config.dtype if config.dtype is not None else torch.get_default_dtype(),
+        if self.use_gate:
+            self.o_norm = (
+                OlmoHybridRMSNormGated(self.head_v_dim, eps=1e-5)
+                if FusedRMSNormGated is None
+                else FusedRMSNormGated(
+                    self.head_v_dim,
+                    eps=1e-5,
+                    device=torch.cuda.current_device(),
+                    dtype=config.dtype if config.dtype is not None else torch.get_default_dtype(),
+                )
             )
-        )
+        else:
+            self.o_norm = OlmoHybridRMSNorm(self.head_v_dim, eps=1e-5)
 
         self.chunk_gated_delta_rule = chunk_gated_delta_rule or torch_chunk_gated_delta_rule
         self.recurrent_gated_delta_rule = fused_recurrent_gated_delta_rule or torch_recurrent_gated_delta_rule
@@ -655,10 +665,13 @@ class OlmoHybridGatedDeltaNet(nn.Module):
         if cache_params is not None:
             cache_params.recurrent_states[self.layer_idx] = new_recurrent_state
 
-        gate = self.g_proj(hidden_states)
         output = output.reshape(-1, self.head_v_dim)
-        gate = gate.reshape(-1, self.head_v_dim)
-        output = self.o_norm(output, gate)
+        if self.use_gate:
+            gate = self.g_proj(hidden_states)
+            gate = gate.reshape(-1, self.head_v_dim)
+            output = self.o_norm(output, gate)
+        else:
+            output = self.o_norm(output)
         output = output.reshape(batch_size, seq_len, -1)
 
         output = self.o_proj(output)
@@ -682,9 +695,11 @@ class OlmoHybridLinearAttentionDecoderLayer(LlamaDecoderLayer):
         super().__init__(config, layer_idx)
         self.layer_type = "linear_attention"
         del self.self_attn
+        del self.input_layernorm
+        del self.post_attention_layernorm
         self.linear_attn = OlmoHybridGatedDeltaNet(config, layer_idx=layer_idx)
-        self.input_layernorm = OlmoHybridRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.post_attention_layernorm = OlmoHybridRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.attention_layer_norm = OlmoHybridRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.feedforward_layer_norm = OlmoHybridRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.mlp = OlmoHybridMLP(config)
 
     def forward(
@@ -700,7 +715,7 @@ class OlmoHybridLinearAttentionDecoderLayer(LlamaDecoderLayer):
         **kwargs: Unpack[TransformersKwargs],
     ) -> torch.Tensor:
         residual = hidden_states
-        hidden_states = self.input_layernorm(hidden_states)
+        hidden_states = self.attention_layer_norm(hidden_states)
         # Main difference to llama - signature (`cache_params`) and linear attention
         hidden_states = self.linear_attn(
             hidden_states=hidden_states,
@@ -711,7 +726,7 @@ class OlmoHybridLinearAttentionDecoderLayer(LlamaDecoderLayer):
         hidden_states = residual + hidden_states
 
         residual = hidden_states
-        hidden_states = self.post_attention_layernorm(hidden_states)
+        hidden_states = self.feedforward_layer_norm(hidden_states)
         hidden_states = self.mlp(hidden_states)
         hidden_states = residual + hidden_states
 

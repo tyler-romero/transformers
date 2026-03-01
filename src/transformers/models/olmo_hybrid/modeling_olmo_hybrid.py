@@ -645,6 +645,7 @@ class OlmoHybridGatedDeltaNet(nn.Module):
         self.value_dim = self.head_v_dim * self.num_v_heads
         self.layer_idx = layer_idx
         self.conv_kernel_size = config.linear_conv_kernel_dim
+        self.use_gate = config.linear_use_gate
         self.allow_neg_eigval = config.linear_allow_neg_eigval
         self.eps = config.rms_norm_eps
 
@@ -654,7 +655,8 @@ class OlmoHybridGatedDeltaNet(nn.Module):
         self.a_proj = nn.Linear(self.hidden_size, self.num_v_heads, bias=False)
         self.b_proj = nn.Linear(self.hidden_size, self.num_v_heads, bias=False)
 
-        self.g_proj = nn.Linear(self.hidden_size, self.value_dim, bias=False)
+        if self.use_gate:
+            self.g_proj = nn.Linear(self.hidden_size, self.value_dim, bias=False)
 
         self.o_proj = nn.Linear(self.value_dim, self.hidden_size, bias=False)
 
@@ -693,16 +695,19 @@ class OlmoHybridGatedDeltaNet(nn.Module):
         self.dt_bias = nn.Parameter(inv_dt)
 
         # Output norm - NOTE: FLA's FusedRMSNormGated uses eps=1e-5 by default
-        self.o_norm = (
-            OlmoHybridRMSNormGated(self.head_v_dim, eps=1e-5)
-            if FusedRMSNormGated is None
-            else FusedRMSNormGated(
-                self.head_v_dim,
-                eps=1e-5,
-                device=torch.cuda.current_device(),
-                dtype=config.dtype if config.dtype is not None else torch.get_default_dtype(),
+        if self.use_gate:
+            self.o_norm = (
+                OlmoHybridRMSNormGated(self.head_v_dim, eps=1e-5)
+                if FusedRMSNormGated is None
+                else FusedRMSNormGated(
+                    self.head_v_dim,
+                    eps=1e-5,
+                    device=torch.cuda.current_device(),
+                    dtype=config.dtype if config.dtype is not None else torch.get_default_dtype(),
+                )
             )
-        )
+        else:
+            self.o_norm = OlmoHybridRMSNorm(self.head_v_dim, eps=1e-5)
 
         self.chunk_gated_delta_rule = chunk_gated_delta_rule or torch_chunk_gated_delta_rule
         self.recurrent_gated_delta_rule = fused_recurrent_gated_delta_rule or torch_recurrent_gated_delta_rule
@@ -795,10 +800,13 @@ class OlmoHybridGatedDeltaNet(nn.Module):
         if cache_params is not None:
             cache_params.recurrent_states[self.layer_idx] = new_recurrent_state
 
-        gate = self.g_proj(hidden_states)
         output = output.reshape(-1, self.head_v_dim)
-        gate = gate.reshape(-1, self.head_v_dim)
-        output = self.o_norm(output, gate)
+        if self.use_gate:
+            gate = self.g_proj(hidden_states)
+            gate = gate.reshape(-1, self.head_v_dim)
+            output = self.o_norm(output, gate)
+        else:
+            output = self.o_norm(output)
         output = output.reshape(batch_size, seq_len, -1)
 
         output = self.o_proj(output)
@@ -871,10 +879,10 @@ class OlmoHybridLinearAttentionDecoderLayer(GradientCheckpointingLayer):
         super().__init__()
         self.hidden_size = config.hidden_size
         self.mlp = OlmoHybridMLP(config)
-        self.input_layernorm = OlmoHybridRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.post_attention_layernorm = OlmoHybridRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.layer_type = "linear_attention"
         self.linear_attn = OlmoHybridGatedDeltaNet(config, layer_idx=layer_idx)
+        self.attention_layer_norm = OlmoHybridRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.feedforward_layer_norm = OlmoHybridRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
     def forward(
         self,
@@ -889,7 +897,7 @@ class OlmoHybridLinearAttentionDecoderLayer(GradientCheckpointingLayer):
         **kwargs: Unpack[TransformersKwargs],
     ) -> torch.Tensor:
         residual = hidden_states
-        hidden_states = self.input_layernorm(hidden_states)
+        hidden_states = self.attention_layer_norm(hidden_states)
         # Main difference to llama - signature (`cache_params`) and linear attention
         hidden_states = self.linear_attn(
             hidden_states=hidden_states,
@@ -900,7 +908,7 @@ class OlmoHybridLinearAttentionDecoderLayer(GradientCheckpointingLayer):
         hidden_states = residual + hidden_states
 
         residual = hidden_states
-        hidden_states = self.post_attention_layernorm(hidden_states)
+        hidden_states = self.feedforward_layer_norm(hidden_states)
         hidden_states = self.mlp(hidden_states)
         hidden_states = residual + hidden_states
 
