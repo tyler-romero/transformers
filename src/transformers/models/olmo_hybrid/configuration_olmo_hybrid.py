@@ -101,9 +101,6 @@ class OlmoHybridConfig(PreTrainedConfig):
             Floor value for clamping dt during initialization in GatedDeltaNet layers.
         linear_conv_kernel_dim (`int`, *optional*, defaults to 4):
             Kernel size for the short convolution applied to queries, keys, and values in linear attention layers.
-        linear_use_gate (`bool`, *optional*, defaults to `True`):
-            Whether to use a gating mechanism in the GatedDeltaNet linear attention layers. When `True`,
-            a separate gate projection (`g_proj`) is applied with gated RMSNorm on the output.
         linear_allow_neg_eigval (`bool`, *optional*, defaults to `True`):
             Whether to allow negative eigenvalues in the GatedDeltaNet recurrence. When `True`, the beta
             parameter is scaled by 2.0 to allow values in range [0, 2] instead of [0, 1].
@@ -169,7 +166,6 @@ class OlmoHybridConfig(PreTrainedConfig):
         linear_dt_max: float = 0.1,
         linear_dt_init_floor: float = 1e-4,
         linear_conv_kernel_dim: int = 4,
-        linear_use_gate: bool = True,
         linear_allow_neg_eigval: bool = True,
         **kwargs,
     ):
@@ -210,7 +206,6 @@ class OlmoHybridConfig(PreTrainedConfig):
         self.linear_dt_max = linear_dt_max
         self.linear_dt_init_floor = linear_dt_init_floor
         self.linear_conv_kernel_dim = linear_conv_kernel_dim
-        self.linear_use_gate = linear_use_gate
         self.linear_allow_neg_eigval = linear_allow_neg_eigval
         self.vocab_size = vocab_size
         self.max_position_embeddings = max_position_embeddings
